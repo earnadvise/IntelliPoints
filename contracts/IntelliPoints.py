@@ -3,19 +3,22 @@
 from genlayer import *
 import json
 
-# Fixed amount of points awarded per accepted contribution claim.
+# Fixed points awarded per accepted contribution
 MINT_AMOUNT: int = 100
 
 
 class IntelliPoints(gl.Contract):
     """
-    A permissionless points token on GenLayer.
+    Permissionless contribution-points token on GenLayer.
 
-    Anyone can:
-      - mint(claim)    — earn MINT_AMOUNT points by submitting a contribution
-                         claim that passes LLM consensus via the Equivalence Principle.
-      - transfer(to, amount) — send points to another address.
-      - burn(amount)   — destroy your own points.
+    To mint points, a caller must supply:
+      - A short description of their contribution
+      - A public evidence URL (GitHub PR, issue, commit, merged diff, etc.)
+
+    During mint, each node independently fetches the evidence URL and asks
+    the LLM to judge whether the page confirms a genuine contribution.
+    Leader and validator must agree (run_nondet_unsafe) before any points
+    are credited. Free-text claims with no verifiable evidence are rejected.
 
     Invariant: sum(balances) == total_supply at all times.
     """
@@ -41,45 +44,74 @@ class IntelliPoints(gl.Contract):
     # ─── Write methods ───────────────────────────────────────────────────────
 
     @gl.public.write
-    def mint(self, claim: str) -> None:
+    def mint(self, description: str, evidence_url: str) -> None:
         """
         Attempt to mint MINT_AMOUNT points to the caller.
 
-        The claim is judged by an LLM using the Equivalence Principle with a
-        custom validator function (run_nondet_unsafe). The leader and each
-        validator independently prompt the LLM and compare the `approved`
-        field of their results. If consensus agrees the claim is a genuine
-        contribution, points are credited; otherwise the transaction is
-        undetermined and no state is changed.
+        Parameters:
+          description  — short plain-text summary of the contribution
+                         (e.g. "Fixed null pointer bug in auth module")
+          evidence_url — publicly accessible URL that contains verifiable
+                         evidence of the contribution, such as:
+                           - A GitHub pull request URL
+                           - A GitHub issue URL
+                           - A GitHub commit URL
+                           - A merged diff page
+
+        Each node independently fetches evidence_url, reads the live page
+        content, and asks the LLM whether the page confirms the described
+        contribution. Leader and validator compare their `approved` fields
+        via run_nondet_unsafe — both must agree before points are minted.
         """
-        caller: Address = gl.message.sender_account
+        if not description.strip():
+            raise Exception("Description must not be empty")
+        if not evidence_url.strip():
+            raise Exception("evidence_url must not be empty")
 
-        # Build the prompt outside the non-deterministic block so the same
-        # string reaches every node.
-        prompt = f"""You are an impartial judge for a contribution-points system.
-A participant is claiming credit for a contribution. Evaluate whether the
-claim describes a genuine, meaningful contribution (writing code, fixing a
-bug, writing documentation, reporting a real issue, creating useful content,
-providing thoughtful feedback, etc.).
+        caller: Address = gl.message.sender_address
 
-Claim: "{claim}"
+        def _fetch_and_judge() -> dict:
+            """
+            Fetch live evidence and ask the LLM to judge the contribution.
+            Called independently on leader and each validator node.
+            """
+            response = gl.nondet.web.get(evidence_url)
+            page_text = response.body.decode("utf-8")
+            snippet = page_text[:4000] if len(page_text) > 4000 else page_text
 
-Respond with ONLY valid JSON in this exact format, nothing else:
+            prompt = f"""You are an impartial judge for a contribution-points system.
+
+A participant claims they made the following contribution:
+"{description}"
+
+They provided this evidence URL: {evidence_url}
+
+Below is the LIVE content fetched from that URL:
+--- EVIDENCE START ---
+{snippet}
+--- EVIDENCE END ---
+
+Based ONLY on the evidence above (not prior knowledge), decide:
+  - Does the fetched page confirm a genuine, meaningful contribution?
+  - A genuine contribution includes: merged pull requests, closed issues with
+    a fix, commits with substantive code changes, documented bug reports,
+    or meaningful documentation updates.
+  - Reject if: the page is unrelated, the PR/issue is still open with no
+    meaningful activity, the change is trivial (typo, single character), or
+    the evidence does not match the description.
+
+Respond with ONLY valid JSON in exactly this format, nothing else:
 {{
   "approved": true,
-  "reason": "brief one-sentence justification"
+  "reason": "one sentence citing specific evidence from the page"
 }}
 or
 {{
   "approved": false,
-  "reason": "brief one-sentence justification"
+  "reason": "one sentence explaining what was missing or mismatched"
 }}
 """
-
-        def _call_llm() -> dict:
-            """Run the LLM and return a parsed dict with at least 'approved' (bool)."""
             raw = gl.nondet.exec_prompt(prompt)
-            # Strip markdown code fences if the model adds them.
             cleaned = raw.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("```")[1]
@@ -90,30 +122,22 @@ or
             return result
 
         def leader_fn() -> dict:
-            return _call_llm()
+            return _fetch_and_judge()
 
         def validator_fn(leader_result: gl.vm.Result) -> bool:
-            # If the leader errored, reject.
             if not isinstance(leader_result, gl.vm.Return):
                 return False
-
             leader_approved: bool = leader_result.calldata.get("approved", False)
-
-            # Run our own independent judgment.
             try:
-                validator_result = _call_llm()
+                # Validator independently fetches the same URL and judges
+                validator_result = _fetch_and_judge()
             except Exception:
-                # If we cannot produce a verdict, reject to be safe.
                 return False
-
             validator_approved: bool = validator_result.get("approved", False)
-
-            # Both must agree on the approval decision.
+            # Both independent verdicts must agree
             return leader_approved == validator_approved
 
-        # Run the non-deterministic block; raises if consensus is not reached.
         consensus_result: dict = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-
         approved: bool = consensus_result.get("approved", False)
 
         if approved:
@@ -124,25 +148,18 @@ or
     @gl.public.write
     def transfer(self, to: Address, amount: u256) -> None:
         """
-        Transfer *amount* points from the caller to *to*.
+        Transfer *amount* points from caller to *to*.
 
-        Reverts if:
-          - amount is zero
-          - caller and recipient are the same address
-          - caller's balance is insufficient
+        Reverts if amount is zero, sender == recipient, or balance insufficient.
         """
-        caller: Address = gl.message.sender_account
-
+        caller: Address = gl.message.sender_address
         if amount == u256(0):
-            raise gl.UserError("Transfer amount must be greater than zero")
-
+            raise Exception("Transfer amount must be greater than zero")
         if caller == to:
-            raise gl.UserError("Cannot transfer to yourself")
-
+            raise Exception("Cannot transfer to yourself")
         sender_balance = self.balances.get(caller, u256(0))
         if sender_balance < amount:
-            raise gl.UserError("Insufficient balance")
-
+            raise Exception("Insufficient balance")
         self.balances[caller] = sender_balance - amount
         recipient_balance = self.balances.get(to, u256(0))
         self.balances[to] = recipient_balance + amount
@@ -150,20 +167,15 @@ or
     @gl.public.write
     def burn(self, amount: u256) -> None:
         """
-        Destroy *amount* points from the caller's balance.
+        Destroy *amount* points from caller's balance.
 
-        Reverts if:
-          - amount is zero
-          - caller's balance is insufficient
+        Reverts if amount is zero or balance insufficient.
         """
-        caller: Address = gl.message.sender_account
-
+        caller: Address = gl.message.sender_address
         if amount == u256(0):
-            raise gl.UserError("Burn amount must be greater than zero")
-
+            raise Exception("Burn amount must be greater than zero")
         sender_balance = self.balances.get(caller, u256(0))
         if sender_balance < amount:
-            raise gl.UserError("Insufficient balance")
-
+            raise Exception("Insufficient balance")
         self.balances[caller] = sender_balance - amount
         self.total_supply = self.total_supply - amount
