@@ -12,10 +12,16 @@ IntelliPoints is a permissionless points token on GenLayer. Any address can earn
 
 ## Tech Stack
 
-- Contract: Python 3, GenVM SDK (`py-genlayer`) — `contracts/IntelliPoints.py`
+- Language: Python 3, GenVM SDK (`py-genlayer`)
 - Chain: GenLayer (any network)
 - Runner: `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` (pinned)
-- Design doc: `contracts/IntelliPoints-design.md`
+
+## Contracts
+
+| Contract | File | Design Doc | Deployed (Studionet) |
+|----------|------|-----------|----------------------|
+| IntelliPoints | `contracts/IntelliPoints.py` | `contracts/IntelliPoints-design.md` | `0x9f02b54411C5b38D7Fd8BCdb73f8d010bB1314C8` |
+| PredictionMarket | `contracts/PredictionMarket.py` | `contracts/PredictionMarket-design.md` | TBD |
 
 ## Key Files
 
